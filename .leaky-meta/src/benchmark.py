@@ -1,11 +1,12 @@
 # For py2 compat
 from __future__ import division
-import os
 import csv
-import json
-import subprocess
 from io import StringIO
-from subprocess import PIPE
+from pathlib import Path
+from scanners.scanner import SecretScanner
+from scanners.gitleaks import Gitleaks
+from scanners.trufflehog import TruffleHog
+from scanners.detect_secrets import DetectSecrets
 
 def get_secret_counts():
     '''
@@ -22,54 +23,10 @@ def get_secret_counts():
         # Yield str, int, int.
         yield [row[0], int(row[1]), int(row[2])]
 
-def get_command_stdout(cmd, cwd='..'):
-    os.path.abspath(cwd)
-    p = subprocess.Popen(cmd, stdout=PIPE, stderr=PIPE, cwd=cwd)
-    stdout, stderr = p.communicate()
-    return stdout.decode('utf-8'), stderr.decode('utf-8') if stderr else None
 
-def get_secret_count_detectsecrets():
-    finds = {}
-    cmd = ['detect-secrets', 'scan']
-    stdout, _ = get_command_stdout(cmd)
-    results = json.loads(stdout).get('results')
-    for key in results.keys():
-        finds[key] = len(results.get(key))
-
-    return cmd, finds
-
-def get_secret_count_gitleaks():
-    finds = {}
-    cmd = ['gitleaks', '--config=.leaky-meta/gitleaks-config.toml', '--report=.leaky-meta/gitleaks.json', '--repo-path', '.']
-    stdout, stderr = get_command_stdout(cmd)
-    with open('gitleaks.json') as f:
-        data = json.load(f)
-    for obj in  data:
-        filename = obj.get('file')
-        if not filename in finds:
-            finds[filename] = 0
-        finds[filename] += 1
-    
-    # Clean up
-    os.remove('gitleaks.json')
-    return cmd, finds
-
-def get_secret_count_trufflehog():
-    finds = {}
-    trufflehog_cmd = ['trufflehog', '--json', '--regex', '.']
-    stdout, _ = get_command_stdout(trufflehog_cmd)
-    for line in stdout.split('\n'):
-        if len(line) == 0:
-            # Skip empty lines
-            continue
-        obj = json.loads(line)
-        finds[obj.get('path')] = len(obj.get('stringsFound'))
-
-    return trufflehog_cmd, finds
-
-def build_markdown_rows(secrets_function, expected_counts):
+def build_markdown_rows(scanner: SecretScanner, expected_counts):
     dat = {}
-    cmd, secrets = secrets_function()
+    secrets = scanner.scan()
     for row in expected_counts:
         name = row[0]
         expected = row[1] + row[2]
@@ -83,14 +40,14 @@ def build_markdown_rows(secrets_function, expected_counts):
         # This will be zero or positive.
         false_positives = max(false_positives, 0)
         dat[name] = {'name': name, 'found': found, 'expected': expected, 'false_positives' :false_positives }
-    return cmd, dat
+    return dat
 
 def build_table_header(filename_cols):
     template = 'File Name{}|  Found/Total   | False Positives |\n{}|----------------|-----------------|\n'
     # 9 = len('File Name')
     return template.format(' ' * (filename_cols - 9), '-' * filename_cols)
 
-def build_md_table(secrets_function):
+def build_md_table(scanner: SecretScanner):
     # {name}{padding}| {found}/{total} |{false positives}
     print_template = '{}{}| {}/{} | {}\n'
 
@@ -100,7 +57,7 @@ def build_md_table(secrets_function):
     out = build_table_header(sep_col)
     total_files = len(expected_counts)
     
-    cmd_used, md_rows = build_markdown_rows(secrets_function, expected_counts)
+    md_rows = build_markdown_rows(scanner, expected_counts)
     md_rows = sorted(md_rows.items(), key=lambda val: -val[1]['found'])
     total_finds = 0
     total_expected = 0
@@ -125,9 +82,9 @@ def build_md_table(secrets_function):
             files_covered += 1
 
         out += print_template.format(name, right_padding_str, found, expected, false_positives)
-    return cmd_used, total_files, files_covered, total_finds, total_expected, total_false_positives, out
+    return total_files, files_covered, total_finds, total_expected, total_false_positives, out
 
-def build_md(secrets_function, tool_url):
+def build_md(scanner: SecretScanner):
     header_fmt = 'Tool: {}  ' \
                  '\nCommand Used: `{}`  ' \
                  '\nFiles covered: {}/{} ({}% coverage)  ' \
@@ -135,10 +92,10 @@ def build_md(secrets_function, tool_url):
                  '\nFalse Positives: {}  ' \
                  '\n\n{}'
     
-    cmd, total_files, files_covered, total_finds, \
-     total_expected, false_positives, table = build_md_table(secrets_function)
+    total_files, files_covered, total_finds, \
+     total_expected, false_positives, table = build_md_table(scanner)
     # Convert cmd to a string
-    cmd = ' '.join(cmd)
+    cmd = ' '.join(scanner.cmd)
 
     # Get a % coverage value
     file_coverage = (files_covered / total_files) * 100
@@ -148,20 +105,17 @@ def build_md(secrets_function, tool_url):
     # Sanity!
     file_coverage = round(file_coverage, 2)
     find_coverage = round(find_coverage, 2)
-    out = header_fmt.format(tool_url, cmd,
+    out = header_fmt.format(scanner.url, cmd,
                            files_covered, total_files, file_coverage, 
                            total_finds, total_expected, find_coverage,
                            false_positives, table)
     return out
 
 if __name__ == '__main__':
-    detect_secrets = build_md(get_secret_count_detectsecrets, 'https://github.com/Yelp/detect-secrets')
-    truffle_hog = build_md(get_secret_count_trufflehog, 'https://github.com/dxa4481/truffleHog')
-    gitleaks = build_md(get_secret_count_gitleaks, 'https://github.com/zricethezav/gitleaks')
-    with open('benchmarking' + os.path.sep + 'TRUFFLEHOG.md', 'w+') as f:
-        f.write(truffle_hog)
-    with open('benchmarking' + os.path.sep + 'DETECT-SECRETS.md', 'w+') as f:
-        f.write(detect_secrets)
-    with open('benchmarking' + os.path.sep + 'GITLEAKS.md', 'w+') as f:
-        f.write(gitleaks)
+    scanners = [Gitleaks(), DetectSecrets(), TruffleHog()]
+    for scanner in scanners:
+        md = build_md(scanner)
+        print(f'Running {type(scanner).__name__}')
+        with open(Path('benchmarking') / scanner.report_filename, 'w+') as f:
+            f.write(md)
         

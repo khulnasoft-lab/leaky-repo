@@ -1,1 +1,5 @@
 *.toml
+./gitleaks-install
+./gitleaks-install/*
+__pycache__/*
+*.pyc
